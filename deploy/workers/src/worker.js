@@ -1,5 +1,6 @@
+
 /**
- * Cloudflare Workers API for AI Lab Audit
+ * Cloudflare Workers API for Document Intelligence / RAG
  * Free tier: 100K req/day
  */
 
@@ -9,8 +10,7 @@ const router = Router();
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
-    status,
-    headers: { 'Content-Type': 'application/json' },
+    status, headers: { 'Content-Type': 'application/json' },
   });
 }
 
@@ -18,127 +18,76 @@ function error(message, status = 400) {
   return json({ error: message }, status);
 }
 
-// ─── Health ───────────────────────────────────────────────────────
-
 router.get('/health', () => json({
-  status: 'ok',
-  service: 'ai-lab-audit-api',
-  version: '0.1.0',
+  status: 'ok', service: 'doc-intel-api', version: '0.1.0',
   timestamp: new Date().toISOString(),
 }));
 
-// ─── Audit CRUD ──────────────────────────────────────────────────
-
-// POST /api/v1/audits — Create audit request
-router.post('/api/v1/audits', async (request, env) => {
+router.post('/api/v1/documents', async (request, env) => {
   const body = await request.json();
-  const { workspace_name, repo_url } = body;
-  if (!workspace_name) return error('workspace_name is required');
+  const { filename, file_type } = body;
+  if (!filename) return error('filename is required');
 
   const result = await env.DB.prepare(
-    `INSERT INTO audits (workspace_name, repo_url, audited_at, status)
-     VALUES (?, ?, datetime('now'), 'pending')`
-  ).bind(workspace_name, repo_url || null).run();
+    `INSERT INTO documents (filename, file_type, status) VALUES (?, ?, 'processing')`
+  ).bind(filename, file_type || 'unknown').run();
 
-  return json({ audit_id: result.meta.last_row_id, workspace_name, status: 'pending' });
+  return json({ document_id: result.meta.last_row_id, filename, status: 'processing' });
 });
 
-// GET /api/v1/audits — List all audits
-router.get('/api/v1/audits', async (request, env) => {
+router.get('/api/v1/documents', async (request, env) => {
   const result = await env.DB.prepare(
-    'SELECT * FROM audits ORDER BY audited_at DESC LIMIT 50'
+    'SELECT * FROM documents ORDER BY created_at DESC LIMIT 50'
   ).all();
-  return json({ audits: result.results });
+  return json({ documents: result.results });
 });
 
-// GET /api/v1/audits/:id — Get audit details
-router.get('/api/v1/audits/:id', async (request, env) => {
-  const audit = await env.DB.prepare(
-    'SELECT * FROM audits WHERE id = ?'
-  ).bind(parseInt(request.params.id)).first();
-  if (!audit) return error('Audit not found', 404);
+router.post('/api/v1/query', async (request, env) => {
+  const body = await request.json();
+  const { query } = body;
+  if (!query) return error('query is required');
 
-  const findings = await env.DB.prepare(
-    'SELECT * FROM findings WHERE audit_id = ? ORDER BY severity DESC'
-  ).bind(audit.id).all();
+  const start = Date.now();
+  const keywords = query.toLowerCase().split(' ').filter(w => w.length > 3);
+  let results = [];
 
-  return json({ ...audit, findings: findings.results });
-});
-
-// ─── Health Score Endpoint ────────────────────────────────────────
-
-// GET /api/v1/score/:workspace — Get health score
-router.get('/api/v1/score/:workspace', async (request, env) => {
-  const workspace = request.params.workspace;
-  const audits = await env.DB.prepare(
-    'SELECT * FROM audits WHERE workspace_name = ? AND status = ? ORDER BY audited_at DESC LIMIT 1'
-  ).bind(workspace, 'completed').all();
-
-  if (audits.results.length === 0) {
-    return json({ workspace, score: null, message: 'No completed audits yet' });
+  if (keywords.length > 0) {
+    const allChunks = await env.DB.prepare('SELECT id, document_id, content FROM chunks').all();
+    results = allChunks.results
+      .map(c => ({ ...c, score: keywords.filter(k => c.content.toLowerCase().includes(k)).length }))
+      .filter(c => c.score > 0)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 5);
   }
 
-  const latest = audits.results[0];
-  return json({
-    workspace,
-    score: latest.overall_score,
-    critical: latest.critical_findings,
-    high: latest.high_findings,
-    medium: latest.medium_findings,
-    total: latest.total_findings,
-    last_audited: latest.audited_at,
-  });
+  return json({ query, results, latency_ms: Date.now() - start, model: 'local' });
 });
 
-// ─── Webhook ─────────────────────────────────────────────────────
+router.get('/api/v1/stats', async (request, env) => {
+  const docs = await env.DB.prepare('SELECT COUNT(*) as count FROM documents').first();
+  const chunks = await env.DB.prepare('SELECT COUNT(*) as count FROM chunks').first();
+  const queries = await env.DB.prepare('SELECT COUNT(*) as count FROM queries').first();
+  return json({ documents: docs.count, chunks: chunks.count, queries: queries.count });
+});
 
 router.post('/api/v1/webhook/github', async (request, env) => {
   const event = request.headers.get('x-github-event');
   const payload = await request.json();
-
-  if (event === 'push') {
-    return json({ status: 'received', repo: payload.repository?.full_name });
-  }
-
+  if (event === 'push') return json({ status: 'received', repo: payload.repository?.full_name });
   return json({ status: 'ignored', event });
 });
 
 async function handleCron(event, env) {
-  const pending = await env.DB.prepare(
-    "SELECT * FROM audits WHERE status = 'pending'"
-  ).all();
-
-  for (const audit of pending.results) {
-    // Simulate audit completion
-    await env.DB.prepare(
-      `UPDATE audits SET status = 'completed', 
-       overall_score = 85.0, critical_findings = 0, high_findings = 2, 
-       medium_findings = 5, total_findings = 7, audited_at = datetime('now')
-       WHERE id = ?`
-    ).bind(audit.id).run();
-
-    // Send notification
-    if (env.SLACK_WEBHOOK_URL) {
-      await fetch(env.SLACK_WEBHOOK_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          text: `🔍 AI Lab Audit completed for \`${audit.workspace_name}\`: Score 85/100 (0 critical, 2 high, 5 medium)`,
-        }),
-      });
-    }
+  const pending = await env.DB.prepare("SELECT * FROM documents WHERE status = 'pending'").all();
+  for (const doc of pending.results) {
+    await env.DB.prepare("UPDATE documents SET status = 'completed' WHERE id = ?").bind(doc.id).run();
   }
-
-  return json({ status: 'ok', processed: pending.results.length });
+  return json({ processed: pending.results.length });
 }
 
 router.all('*', () => error('Not found', 404));
 
 export default {
-  async fetch(request, env, ctx) {
-    return router.fetch(request, env, ctx);
-  },
-  async scheduled(event, env, ctx) {
-    ctx.waitUntil(handleCron(event, env));
-  },
+  async fetch(request, env, ctx) { return router.fetch(request, env, ctx); },
+  async scheduled(event, env, ctx) { ctx.waitUntil(handleCron(event, env)); },
 };
