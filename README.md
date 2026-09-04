@@ -1,5 +1,9 @@
 # doc-intel-api — Deployment
 
+<!-- BEGIN: REPO HERO -->
+![doc-intel-api — hero generated locally on the GPU stack](assets/repo-hero.png)
+<!-- END: REPO HERO -->
+
 Deployment wrapper for the document-intelligence API. This repository contains **deploy configuration only** (no application source — the API runs from the EPYC lab's local services).
 
 ## Contents
